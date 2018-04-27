@@ -1,0 +1,74 @@
+    readFile = 'D:\\学习\\毕设\\排队模型python\\WTIS统计14.xlsx'
+
+    wb = load_workbook(readFile,read_only = True)
+    ws = wb.get_sheet_by_name('Sheet1')
+    sheet = wb.active
+    
+    ws_rows_len = sheet.max_row   #len(list(ws.rows))          #行数
+    ws_col_len = sheet.max_column #len(list(ws.columns))    #列数
+    temp_data=[[0 for i in range(ws_col_len)] for j in range(ws_rows_len-1)]
+    
+    for i in range(2, ws_rows_len+1):
+        for j in range(1, ws_col_len+1):
+            temp_data[i-2][j-1] = ws.cell(row=i,column=j).value
+
+    wb.close()
+    Patient.pi[1] = 39.53033268
+    Patient.pi[2] = 29.35420744
+    Patient.pi[3] = 19.1372549
+    Patient.pi[4] = 0
+    Patient.alpha = 4.49002014
+    Patient.beta = 0.83382209
+    queue=[]
+    duration = 300 #len(temp_data) #仿真天数
+    pri_arr_num = [0,0,0,0,0] #统计仿真期间各优先级的到达情况
+    global pri_wt
+    pri_wt = np.zeros((duration+1,5),dtype=int)#优先级-等待时间 矩阵
+
+    for i in range(duration):
+        date = i+1
+        #每日患者的到达情况，arrive是优先级-人数字典
+        #num_total = arr_pre()
+        
+        num_p1 = temp_data[i][0]
+        num_p2 = temp_data[i][1]
+        num_p3 = temp_data[i][2]
+        num_p4 = temp_data[i][3]
+        arrive = {1:num_p1,2:num_p2,3:num_p3,4:num_p4}
+
+        pri_arr_num[1] += arrive[1]
+        pri_arr_num[2] += arrive[2]
+        pri_arr_num[3] += arrive[3]
+        pri_arr_num[4] += arrive[4]
+        #将新来的患者入队
+        for j in [1,2,3,4]:
+            for k in range(arrive[j]):
+                queue.append(Patient(j,date))
+
+        #将新来的患者入队后，给队列每个人更新权重
+        for j in range(len(queue)):
+            queue[j].update_weight()
+
+        queue = sorted(queue, key=lambda patient: patient.acc_wei,reverse = True)  # sort by weight
+        
+        #出队并统计等待情况                
+        #num_ser = ser_pre()
+        num_ser = temp_data[i][4]
+        
+        for j in range(num_ser):
+            if len(queue)>0:
+                add_up(queue[0])
+                del queue[0]
+            else:
+#                print('queue is empty')
+                break
+            
+        for j in range(len(queue)):
+            queue[j].update_wait_time()
+            
+    WTinQ = que_end(queue,duration)
+    pw_mat = WTinQ+pri_wt #结束时队列患者的等待时间+出队患者的等待时间
+    total_ET = sum_exc_time(pw_mat)
+    mean_ET = total_ET/sum(pri_arr_num)
+    (ofp,exc) = overflow(pw_mat,pri_arr_num)
+    print('end',mean_ET)
