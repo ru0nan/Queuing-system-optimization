@@ -1,0 +1,242 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Mar 24 14:25:31 2018
+LSTM预测患者到达
+stock predict model
+线性归一化
+@author: lenovo
+"""
+
+from __future__ import print_function
+
+import time
+import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+from numpy import newaxis
+from pandas import DataFrame
+from keras.layers.core import Dense, Activation, Dropout
+from keras.layers.recurrent import LSTM
+from keras.models import Sequential
+from keras import optimizers
+from sklearn.preprocessing import MinMaxScaler,normalize
+from sklearn.metrics import mean_squared_error
+from sklearn.metrics import r2_score
+from math import sqrt
+
+warnings.filterwarnings("ignore")
+
+def load_data(filename, seq_len, normalise_window):
+    f = open(filename, 'rb').read()
+    data = f.split()
+    data = np.array(data)
+    data = data.reshape(len(data),1)
+    if normalise_window:
+        data = normalise_windows(data)
+    
+    #print('data.shape',data.shape)
+    #print('data len:',len(data))
+    #print('sequence len:',seq_len)
+
+    sequence_length = seq_len + 1
+    result = []
+    for index in range(len(data) - sequence_length):
+        result.append(data[index: index + sequence_length])  #得到长度为seq_len+1的向量，最后一个作为label
+
+    #print('normalise_windows result shape:',np.array(result).shape)
+
+    result = np.array(result)
+
+    #划分train、test
+    row = round(0.95 * result.shape[0])
+    train = result[:row, :]
+    np.random.shuffle(train)
+    x_train = train[:, :-1]
+    y_train = train[:, -1]
+    x_test = result[row:, :-1]
+    y_test = result[row:, -1]
+    print('x_train:',x_train.shape,' y_train',y_train.shape)
+    print('x_test:',x_test.shape,' y_test',y_test.shape)
+    
+    
+    
+    x_train = np.reshape(x_train, (x_train.shape[0], x_train.shape[1], 1))
+    x_test = np.reshape(x_test, (x_test.shape[0], x_test.shape[1], 1))
+
+    return [x_train, y_train, x_test, y_test]
+
+def normalise_windows(window_data):
+    print('window_data shape ',window_data.shape)
+    scaled_values = scaler.fit_transform(window_data)
+    scaled_values = scaled_values**1
+#    scaled_values = scaled_values.reshape(len(scaled_values), 1)
+    return scaled_values
+
+def build_model(layers):  #layers [1,50,100,1]
+    model = Sequential()
+    activation1 = 'relu'
+    activation2 = 'relu'
+    activation3 = 'tanh'
+    my_loss = 'mse'
+    my_optimizer = optimizers.RMSprop(lr=0.0005, rho=0.9, epsilon=1e-06)
+    inital = 'he_uniform' 
+    print('activation: ',activation1,' ',activation2,' ',activation3)
+    print('loss: ',my_loss)
+    print(my_optimizer)
+    
+#    model.add(LSTM(input_dim=layers[0],output_dim=layers[1],return_sequences=True)) #作者的代码，运行结果figure2不正确
+    model.add(LSTM(layers[1],input_dim=1,input_length=seq_len,kernel_initializer=inital,
+                   return_sequences=True,activation = activation1)) #我的，运行结果正确。先后指定神经元个数，输入数据维数，维的长度
+    model.add(Dropout(0.1))
+
+    model.add(LSTM(layers[2],return_sequences=False,activation = activation2,
+                   kernel_initializer=inital,))
+    model.add(Dropout(0.1))
+
+    model.add(Dense(output_dim=layers[3]))
+    model.add(Activation(activation3))
+
+    #start = time.time()
+    model.compile(loss=my_loss, optimizer=my_optimizer)
+    #print("Compilation Time : ", time.time() - start)
+    return model
+
+#直接全部预测
+def predict_point_by_point(model, data):
+    predicted = model.predict(data)
+    #print('predicted shape:',np.array(predicted).shape)  #(412L,1L)
+    predicted = np.reshape(predicted, (predicted.size,))
+    return predicted
+
+#滚动预测
+def predict_sequence_full(model, data, window_size):  #data X_test
+    curr_frame = data[0]  #(50L,1L)
+    predicted = []
+    for i in range(len(data)):
+        #x = np.array([[[1],[2],[3]], [[4],[5],[6]]])  x.shape (2, 3, 1) x[0,0] = array([1])  x[:,np.newaxis,:,:].shape  (2, 1, 3, 1)
+        predicted.append(model.predict(curr_frame[newaxis,:,:])[0,0])  #np.array(curr_frame[newaxis,:,:]).shape (1L,50L,1L)
+        curr_frame = curr_frame[1:]
+        curr_frame = np.insert(curr_frame, [window_size-1], predicted[-1], axis=0)   #numpy.insert(arr, obj, values, axis=None)
+    return predicted
+
+def predict_sequences_multiple(model, data, window_size, prediction_len):  #window_size = seq_len
+    prediction_seqs = []
+    for i in range(int(len(data)/prediction_len)):
+        curr_frame = data[i*prediction_len]
+        predicted = []
+        for j in range(prediction_len):
+            predicted.append(model.predict(curr_frame[newaxis,:,:])[0,0])
+            curr_frame = curr_frame[1:]
+            curr_frame = np.insert(curr_frame, [window_size-1], predicted[-1], axis=0)
+        prediction_seqs.append(predicted)
+    return prediction_seqs
+
+def plot_results(predicted_data, true_data, filename):
+    
+    fig = plt.figure(facecolor='white')
+    ax = fig.add_subplot(111)
+    ax.plot(true_data, label='真实值',linestyle='--')
+    plt.plot(predicted_data, label='预测值')
+    plt.xlabel('时间/天')
+    plt.ylabel('每日到达患者/人')
+    plt.legend()
+    plt.show()
+    plt.savefig(filename+'.png')
+
+def evaluate_forecasts(test, forecasts, n_lag, n_seq):
+    for i in range(n_seq):
+        actual = [row[i] for row in test]
+        predicted = [forecast[i] for forecast in forecasts]
+        rmse = sqrt(mean_squared_error(actual, predicted))
+        print('t+%d RMSE: %f' % ((i+1), rmse))
+
+def MAPE(actual,forecasts):
+    length = actual.shape[0]
+    mape = 0
+    for i in range(length):
+        if actual[i][0] != 0 :
+            mape += abs(actual[i][0]-forecasts[i][0])/(actual[i][0])
+    return mape/length
+
+def plot_results_multiple(predicted_data, true_data, prediction_len):
+    fig = plt.figure(facecolor='white')
+    ax = fig.add_subplot(111)
+    ax.plot(true_data, label='Reality')
+    #Pad the list of predictions to shift it in the graph to it's correct start
+    for i, data in enumerate(predicted_data):
+        padding = [None for p in range(i * prediction_len)]
+        plt.plot(padding + data, label='Prediction')
+        plt.legend()
+    plt.show()
+    plt.savefig('plot_results_multiple.png')
+
+def inv_power(data,power):
+    length = data.shape[0]
+    for i in range(length):
+        if data[i][0] < 0:
+            data[i][0] = -(-data[i][0])**(1/power)
+        else:
+            data[i][0] = data[i][0]**(1/power)
+    return data
+
+if __name__=='__main__':
+    global_start_time = time.time()
+    epochs  = 300
+    seq_len = 6
+    n_batch  = 10
+    print('epochs:{}   seq_len:{}   n_batch:{}'.format(epochs,seq_len,n_batch))
+    
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    
+    #print('> Loading data... ')
+
+    X_train, y_train, X_test, y_test = load_data('arr_single2.csv', seq_len, True)
+
+    #print('X_train shape:',X_train.shape)  #(3709L, 50L, 1L)
+    #print('y_train shape:',y_train.shape)  #(3709L,)
+    #print('X_test shape:',X_test.shape)    #(412L, 50L, 1L)
+    #print('y_test shape:',y_test.shape)    #(412L,)
+
+    #print('> Data Loaded. Compiling...')
+
+    model = build_model([1, 50, 90, 1])
+
+    history = model.fit(X_train,y_train,batch_size=n_batch,nb_epoch=epochs,shuffle=True,verbose=0,validation_split=0.1)
+    
+    plt.rcParams['font.sans-serif']=['SimHei'] #用来正常显示中文标签
+    plt.rcParams['axes.unicode_minus']=False #用来正常显示负号
+    plt.figure(1)
+    plt.plot(history.history['loss'],label='训练集')
+    plt.plot(history.history['val_loss'],label='验证集')
+    plt.legend()
+    plt.show()
+
+#    multiple_predictions = predict_sequences_multiple(model, X_test, seq_len, prediction_len=50)
+#    print('multiple_predictions shape:',np.array(multiple_predictions).shape)   #(8L,50L)
+
+#    full_predictions = predict_sequence_full(model, X_test, seq_len)
+#    print('full_predictions shape:',np.array(full_predictions).shape)    #(412L,)
+
+    point_by_point_predictions = predict_point_by_point(model, X_test)
+    point_by_point_predictions = point_by_point_predictions.reshape(point_by_point_predictions.shape[0],1)
+    
+    #inverse transform
+    point_by_point_predictions = inv_power(point_by_point_predictions,1)
+    y_test = inv_power(y_test,1)
+    forecasts = scaler.inverse_transform(point_by_point_predictions)
+    actual = scaler.inverse_transform(y_test)
+    #print('point_by_point_predictions shape:',np.array(point_by_point_predictions).shape)  #(412L)
+
+    #print('Training duration (s) : ', time.time() - global_start_time)
+
+#    plot_results_multiple(multiple_predictions, y_test, 50)
+#    plot_results(full_predictions,y_test,'full_predictions')
+    plot_results(forecasts,actual,'point_by_point_predictions')
+    evaluate_forecasts(actual, forecasts, seq_len, 1)
+    df = DataFrame({'A':actual[:,0],'B':forecasts[:,0]})
+    corr = df.corr()
+    print('corr:',corr['A']['B'])
+    mape = MAPE(actual,forecasts)
+    R2 = r2_score(actual,forecasts)
+    print('MAPE:',mape,'  R2:',R2)
+    
