@@ -1,173 +1,192 @@
 # -*- coding: utf-8 -*-
 """
-Created on Sat Mar 24 14:25:31 2018
-LSTM预测患者到达
+Created on Sat Apr 14 15:14:03 2018
+
 @author: lenovo
 """
 
-from __future__ import print_function
 
-import time
-import warnings
-import numpy as np
-import matplotlib.pyplot as plt
-from numpy import newaxis
-from keras.layers.core import Dense, Activation, Dropout
-from keras.layers.recurrent import LSTM
+from pandas import DataFrame
+from pandas import Series
+from pandas import concat
+from pandas import read_csv
+from pandas import datetime
+from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import MinMaxScaler
 from keras.models import Sequential
+from keras.layers import Dense
+from keras.layers import LSTM
+from math import sqrt
+from matplotlib import pyplot
+from numpy import array
 
-warnings.filterwarnings("ignore")
+# date-time parsing function for loading the dataset
+def parser(x):
+	return datetime.strptime('190'+x, '%Y-%m')
 
-def load_data(filename, seq_len, normalise_window):
-    f = open(filename, 'rb').read()
-    data = f.split()
+# convert time series into supervised learning problem
+def series_to_supervised(data, n_in=1, n_out=1, dropnan=True):
+	n_vars = 1 if type(data) is list else data.shape[1]
+	df = DataFrame(data)
+	cols, names = list(), list()
+	# input sequence (t-n, ... t-1)
+	for i in range(n_in, 0, -1):
+		cols.append(df.shift(i))
+		names += [('var%d(t-%d)' % (j+1, i)) for j in range(n_vars)]
+	# forecast sequence (t, t+1, ... t+n)
+	for i in range(0, n_out):
+		cols.append(df.shift(-i))
+		if i == 0:
+			names += [('var%d(t)' % (j+1)) for j in range(n_vars)]
+		else:
+			names += [('var%d(t+%d)' % (j+1, i)) for j in range(n_vars)]
+	# put it all together
+	agg = concat(cols, axis=1)
+	agg.columns = names
+	# drop rows with NaN values
+	if dropnan:
+		agg.dropna(inplace=True)
+	return agg
 
-    print('data len:',len(data))
-    print('sequence len:',seq_len)
+# create a differenced series
+def difference(dataset, interval=1):
+	diff = list()
+	for i in range(interval, len(dataset)):
+		value = dataset[i] - dataset[i - interval]
+		diff.append(value)
+	return Series(diff)
 
-    sequence_length = seq_len + 1
-    result = []
-    for index in range(len(data) - sequence_length):
-        result.append(data[index: index + sequence_length])  #得到长度为seq_len+1的向量，最后一个作为label
+# transform series into train and test sets for supervised learning
+def prepare_data(series, n_test, n_lag, n_seq):
+	# extract raw values
+	raw_values = series.values
+	# transform data to be stationary
+	diff_series = difference(raw_values, 1)
+	diff_values = diff_series.values
+	diff_values = diff_values.reshape(len(diff_values), 1)
+	# rescale values to -1, 1
+	scaler = MinMaxScaler(feature_range=(-1, 1))
+	scaled_values = scaler.fit_transform(diff_values)
+	scaled_values = scaled_values.reshape(len(scaled_values), 1)
+	# transform into supervised learning problem X, y
+	supervised = series_to_supervised(scaled_values, n_lag, n_seq)
+	supervised_values = supervised.values
+	# split into train and test sets
+	train, test = supervised_values[0:-n_test], supervised_values[-n_test:]
+	return scaler, train, test
 
-    print('result len:',len(result))
-    print('result shape:',np.array(result).shape)
-    print(result[:1])
+# fit an LSTM network to training data
+def fit_lstm(train, n_lag, n_seq, n_batch, nb_epoch, n_neurons):
+	# reshape training into [samples, timesteps, features]
+	X, y = train[:, 0:n_lag], train[:, n_lag:]
+	X = X.reshape(X.shape[0], 1, X.shape[1])
+	# design network
+	model = Sequential()
+	model.add(LSTM(n_neurons, batch_input_shape=(n_batch, X.shape[1], X.shape[2]), stateful=True))
+	model.add(Dense(y.shape[1]))
+	model.compile(loss='mean_squared_error', optimizer='adam')
+	# fit network
+	for i in range(nb_epoch):
+		model.fit(X, y, epochs=1, batch_size=n_batch, verbose=0, shuffle=False)
+		model.reset_states()
+	return model
 
-    if normalise_window:
-        result = normalise_windows(result)
+# make one forecast with an LSTM,
+def forecast_lstm(model, X, n_batch):
+	# reshape input pattern to [samples, timesteps, features]
+	X = X.reshape(1, 1, len(X))
+	# make forecast
+	forecast = model.predict(X, batch_size=n_batch)
+	# convert to array
+	return [x for x in forecast[0, :]]
 
-    print(result[:1])
-    print('normalise_windows result shape:',np.array(result).shape)
+# evaluate the persistence model
+def make_forecasts(model, n_batch, train, test, n_lag, n_seq):
+	forecasts = list()
+	for i in range(len(test)):
+		X, y = test[i, 0:n_lag], test[i, n_lag:]
+		# make forecast
+		forecast = forecast_lstm(model, X, n_batch)
+		# store the forecast
+		forecasts.append(forecast)
+	return forecasts
 
-    result = np.array(result)
+# invert differenced forecast
+def inverse_difference(last_ob, forecast):
+	# invert first forecast
+	inverted = list()
+	inverted.append(forecast[0] + last_ob)
+	# propagate difference forecast using inverted first value
+	for i in range(1, len(forecast)):
+		inverted.append(forecast[i] + inverted[i-1])
+	return inverted
 
-    #划分train、test
-    row = round(0.9 * result.shape[0])
-    train = result[:row, :]
-    np.random.shuffle(train)
-    x_train = train[:, :-1]
-    y_train = train[:, -1]
-    x_test = result[row:, :-1]
-    y_test = result[row:, -1]
+# inverse data transform on forecasts
+def inverse_transform(series, forecasts, scaler, n_test):
+	inverted = list()
+	for i in range(len(forecasts)):
+		# create array from forecast
+		forecast = array(forecasts[i])
+		forecast = forecast.reshape(1, len(forecast))
+		# invert scaling
+		inv_scale = scaler.inverse_transform(forecast)
+		inv_scale = inv_scale[0, :]
+		# invert differencing
+		index = len(series) - n_test + i - 1
+		last_ob = series.values[index]
+		inv_diff = inverse_difference(last_ob, inv_scale)
+		# store
+		inverted.append(inv_diff)
+	return inverted
 
-    x_train = np.reshape(x_train, (x_train.shape[0], x_train.shape[1], 1))
-    x_test = np.reshape(x_test, (x_test.shape[0], x_test.shape[1], 1))
+# evaluate the RMSE for each forecast time step
+def evaluate_forecasts(test, forecasts, n_lag, n_seq):
+	for i in range(n_seq):
+		actual = [row[i] for row in test]
+		predicted = [forecast[i] for forecast in forecasts]
+		rmse = sqrt(mean_squared_error(actual, predicted))
+		print('t+%d RMSE: %f' % ((i+1), rmse))
 
-    return [x_train, y_train, x_test, y_test]
+# plot the forecasts in the context of the original dataset    
+def plot_forecasts(series, forecasts, n_test):
+	# plot the entire dataset in blue
+	pyplot.scatter(range(len(series)),series.values)
+	# plot the forecasts in red
+	for i in range(len(forecasts)):
+		off_s = len(series) - n_test + i - 1
+		off_e = off_s + len(forecasts[i]) + 1
+		xaxis = [x for x in range(off_s, off_e)]
+		yaxis = [series.values[off_s]] + forecasts[i]
+		pyplot.scatter(xaxis, yaxis, color='red',marker='+')
+	# show the plot
+	pyplot.show()
 
-def normalise_windows(window_data):
-    normalised_data = []
-    loop = 0
-    for window in window_data:   #window shape (sequence_length L ,)  即(51L,)
-        
-        if loop == 0:
-            print('窗口！！\n',window)
-            loop=1
-        normalised_window = [(float(p) / (float(window[0])+1) - 1) for p in window]
-        normalised_data.append(normalised_window)
-    return normalised_data
+# load dataset
+readFile ='data_set/patient/4017patient.csv'
+series = read_csv(readFile, header=0, parse_dates=[0],index_col=0, squeeze=True)
+# configure
+n_lag = 6 #时间步长
+n_seq = 2 #预测天数
+n_test = 100 #测试集天数
+n_epochs = 200
+n_batch = 1 #batch size
+n_neurons = 10
+# prepare data
+scaler, train, test = prepare_data(series, n_test, n_lag, n_seq)
+# fit model
+model = fit_lstm(train, n_lag, n_seq, n_batch, n_epochs, n_neurons)
+# make forecasts
+forecasts = make_forecasts(model, n_batch, train, test, n_lag, n_seq)
+# inverse transform forecasts and test
+forecasts = inverse_transform(series, forecasts, scaler, n_test+2)
+actual = [row[n_lag:] for row in test]
+actual = inverse_transform(series, actual, scaler, n_test+2)
+# evaluate forecasts
+evaluate_forecasts(actual, forecasts, n_lag, n_seq)
 
-def build_model(layers):  #layers [1,50,100,1]
-    model = Sequential()
+#forecasts = array(forecasts).flatten()
+#forecasts[forecasts<0] = 0
+#forecasts = list(forecasts)
 
-#    model.add(LSTM(input_dim=layers[0],output_dim=layers[1],return_sequences=True)) #作者的代码，运行结果figure2不正确
-    model.add(LSTM(layers[1],input_dim=1,input_length=7,return_sequences=True)) #我的，运行结果正确。先后指定神经元个数，输入数据维数，维的长度
-    model.add(Dropout(0.2))
-
-    model.add(LSTM(layers[2],return_sequences=False))
-    model.add(Dropout(0.2))
-
-    model.add(Dense(output_dim=layers[3]))
-    model.add(Activation("linear"))
-
-    start = time.time()
-    model.compile(loss="mse", optimizer="rmsprop")
-    print("Compilation Time : ", time.time() - start)
-    return model
-
-#直接全部预测
-def predict_point_by_point(model, data):
-    predicted = model.predict(data)
-    print('predicted shape:',np.array(predicted).shape)  #(412L,1L)
-    predicted = np.reshape(predicted, (predicted.size,))
-    return predicted
-
-#滚动预测
-def predict_sequence_full(model, data, window_size):  #data X_test
-    curr_frame = data[0]  #(50L,1L)
-    predicted = []
-    for i in range(len(data)):
-        #x = np.array([[[1],[2],[3]], [[4],[5],[6]]])  x.shape (2, 3, 1) x[0,0] = array([1])  x[:,np.newaxis,:,:].shape  (2, 1, 3, 1)
-        predicted.append(model.predict(curr_frame[newaxis,:,:])[0,0])  #np.array(curr_frame[newaxis,:,:]).shape (1L,50L,1L)
-        curr_frame = curr_frame[1:]
-        curr_frame = np.insert(curr_frame, [window_size-1], predicted[-1], axis=0)   #numpy.insert(arr, obj, values, axis=None)
-    return predicted
-
-def predict_sequences_multiple(model, data, window_size, prediction_len):  #window_size = seq_len
-    prediction_seqs = []
-    for i in range(int(len(data)/prediction_len)):
-        curr_frame = data[i*prediction_len]
-        predicted = []
-        for j in range(prediction_len):
-            predicted.append(model.predict(curr_frame[newaxis,:,:])[0,0])
-            curr_frame = curr_frame[1:]
-            curr_frame = np.insert(curr_frame, [window_size-1], predicted[-1], axis=0)
-        prediction_seqs.append(predicted)
-    return prediction_seqs
-
-def plot_results(predicted_data, true_data, filename):
-    fig = plt.figure(facecolor='white')
-    ax = fig.add_subplot(111)
-    ax.plot(true_data, label='True Data')
-    plt.plot(predicted_data, label='Prediction')
-    plt.legend()
-    plt.show()
-    plt.savefig(filename+'.png')
-
-def plot_results_multiple(predicted_data, true_data, prediction_len):
-    fig = plt.figure(facecolor='white')
-    ax = fig.add_subplot(111)
-    ax.plot(true_data, label='True Data')
-    #Pad the list of predictions to shift it in the graph to it's correct start
-    for i, data in enumerate(predicted_data):
-        padding = [None for p in range(i * prediction_len)]
-        plt.plot(padding + data, label='Prediction')
-        plt.legend()
-    plt.show()
-    plt.savefig('plot_results_multiple.png')
-
-if __name__=='__main__':
-    global_start_time = time.time()
-    epochs  = 1
-    seq_len = 7
-
-    print('> Loading data... ')
-
-    X_train, y_train, X_test, y_test = load_data('arr_single.csv', seq_len, True)
-
-    print('X_train shape:',X_train.shape)  #(3709L, 50L, 1L)
-    print('y_train shape:',y_train.shape)  #(3709L,)
-    print('X_test shape:',X_test.shape)    #(412L, 50L, 1L)
-    print('y_test shape:',y_test.shape)    #(412L,)
-
-    print('> Data Loaded. Compiling...')
-
-    model = build_model([1, 50, 100, 1])
-
-    model.fit(X_train,y_train,batch_size=512,nb_epoch=epochs,validation_split=0.05)
-
-#    multiple_predictions = predict_sequences_multiple(model, X_test, seq_len, prediction_len=50)
-#    print('multiple_predictions shape:',np.array(multiple_predictions).shape)   #(8L,50L)
-
-#    full_predictions = predict_sequence_full(model, X_test, seq_len)
-#    print('full_predictions shape:',np.array(full_predictions).shape)    #(412L,)
-
-    point_by_point_predictions = predict_point_by_point(model, X_test)
-    print('point_by_point_predictions shape:',np.array(point_by_point_predictions).shape)  #(412L)
-
-    print('Training duration (s) : ', time.time() - global_start_time)
-
-#    plot_results_multiple(multiple_predictions, y_test, 50)
-#    plot_results(full_predictions,y_test,'full_predictions')
-    plot_results(point_by_point_predictions,y_test,'point_by_point_predictions')
+# plot forecasts
+plot_forecasts(series[-n_test:], forecasts, n_test+2)
